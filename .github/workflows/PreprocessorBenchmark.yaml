@@ -1,0 +1,94 @@
+name: Paired preprocessor benchmark
+on:
+  push:
+    branches: ['ci/benchmark-preprocessor']
+    paths: ['.github/workflows/PreprocessorBenchmark.yaml']
+permissions:
+  contents: read
+jobs:
+  benchmark:
+    if: github.repository == 'dsyme/BCApps'
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 6153904ec9bcab2f7cfffcd25c70098b3e90895c
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Compare original and candidate on identical source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $baseline = 'ad1340a55a0ca918488f71e180781e5020c33881'
+          $candidate = '6153904ec9bcab2f7cfffcd25c70098b3e90895c'
+          $baselinePath = Join-Path $env:RUNNER_TEMP 'BaselinePreprocessorSymbols.psm1'
+          $originalModule = git show "${baseline}:build/scripts/TestPreprocessorSymbols.psm1"
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot read the pinned original module.' }
+          $originalModule | Set-Content -LiteralPath $baselinePath -Encoding utf8
+          Import-Module $baselinePath -Prefix Baseline -Force
+          Import-Module ./build/scripts/TestPreprocessorSymbols.psm1 -Force
+          $files = @(Get-ChildItem -LiteralPath $env:GITHUB_WORKSPACE -Recurse -Filter '*.al' -File | Sort-Object FullName)
+          if ($files.Count -ne 37217) { throw "Unexpected source corpus: $($files.Count) files." }
+          $configs = @(
+              @{stem = 'CLEAN'; lowerBound = 26; upperBound = 30},
+              @{stem = 'CLEANSCHEMA'; lowerBound = 23; upperBound = 33}
+          )
+          $commands = @('Test-BaselinePreprocessorSymbols', 'Test-PreprocessorSymbols',
+                        'Test-PreprocessorSymbols', 'Test-BaselinePreprocessorSymbols')
+          $results = @(
+              foreach ($command in $commands) {
+                  $diagnostics = [System.Collections.Generic.List[string]]::new()
+                  $timer = [System.Diagnostics.Stopwatch]::StartNew()
+                  foreach ($file in $files) {
+                      $result = & $command -filePath $file.FullName -symbolConfigs $configs
+                      if ($null -ne $result) {
+                          foreach ($key in @('invalidLowercaseSymbols', 'invalidPatternSymbols', 'invalidStemSymbols')) {
+                              foreach ($message in $result[$key]) {
+                                  $diagnostics.Add("${key}:$message")
+                              }
+                          }
+                      }
+                  }
+                  $timer.Stop()
+                  $json = ConvertTo-Json -InputObject $diagnostics.ToArray() -Compress
+                  $hasher = [System.Security.Cryptography.SHA256]::Create()
+                  try {
+                      $digest = [BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($json))).Replace('-', '')
+                  }
+                  finally { $hasher.Dispose() }
+                  $measurement = [ordered]@{
+                      command = $command
+                      seconds = $timer.Elapsed.TotalSeconds
+                      diagnosticCount = $diagnostics.Count
+                      diagnosticSha256 = $digest
+                  }
+                  Write-Host ($measurement | ConvertTo-Json -Compress)
+                  $measurement
+              }
+          )
+          $report = [ordered]@{
+              baseline = $baseline
+              candidate = $candidate
+              files = $files.Count
+              powershell = $PSVersionTable.PSVersion.ToString()
+              os = [Environment]::OSVersion.VersionString
+              processors = [Environment]::ProcessorCount
+              order = 'original, candidate, candidate, original'
+              results = $results
+          }
+          $output = Join-Path $env:RUNNER_TEMP 'preprocessor-benchmark.json'
+          ConvertTo-Json -InputObject $report -Depth 6 | Set-Content -LiteralPath $output -Encoding utf8
+          if (@($results.diagnosticSha256 | Sort-Object -Unique).Count -ne 1) {
+              throw 'Original and candidate diagnostics differ.'
+          }
+          'Pinned-source Windows benchmark; see preprocessor-benchmark artifact for paired timings and diagnostic hashes.' |
+              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+      - name: Upload measurements
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: preprocessor-benchmark
+          path: ${{ runner.temp }}/preprocessor-benchmark.json
+          if-no-files-found: error
+          retention-days: 7
